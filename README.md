@@ -1,11 +1,3 @@
-```{=html}
-<style>
-  h1 { font-size: 24px; }
-  h2 { font-size: 20px; }
-  h3 { font-size: 16px; }
-</style>
-```
-
 # Bioinformatics Pipeline for Full-length 16S rRNA Gene Analysis Using Nanopore Sequencing
 
 ## Overview
