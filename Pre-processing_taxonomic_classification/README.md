@@ -1,17 +1,3 @@
----
-output:
-  html_document: default
-  pdf_document: default
----
-
-```{=html}
-<style>
-  h1 { font-size: 24px; }
-  h2 { font-size: 20px; }
-  h3 { font-size: 16px; }
-</style>
-```
-
 # Pre-processing and Taxonomic Classification
 
 ## Overview
