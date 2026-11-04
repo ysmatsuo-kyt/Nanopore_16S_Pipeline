@@ -1,11 +1,3 @@
-```{=html}
-<style>
-  h1 { font-size: 24px; }
-  h2 { font-size: 20px; }
-  h3 { font-size: 16px; }
-</style>
-```
-
 # Nanopore read length QC pipeline
 
 **Script:** `nanopore_qc.py`
