@@ -1,0 +1,1680 @@
+---
+title: "Bioinformatics Pipeline for Full-length 16S rRNA Gene Analysis Using Nanopore Sequencing"
+
+format:
+  html:
+    embed-resources: true
+    toc: true
+    toc-depth: 3
+    toc-location: left
+    smooth-scroll: true
+    toc-title: "Table of Contents"
+    number-sections: true
+    theme: cosmo
+    fontsize: 0.9em
+    linkcolor: "#0055aa"
+    mainfont: "Arial"
+    code-block-bg: true
+    code-copy: true
+
+header-includes:
+  - |
+      <style>
+      .user-param {
+        background-color: #fff8cc;
+        border: 1px solid #d6c36a;
+        padding: 2px 6px;
+        border-radius: 4px;
+        font-family: monospace;
+        font-size: 0.9em;
+      }
+
+      .user-setting {
+        background-color: #fffdf0;
+        border-left: 4px solid #d6c36a;
+        padding: 10px;
+        margin: 10px 0;
+      }
+      </style>
+
+execute:
+  eval: true
+  echo: true
+  warning: false
+  message: false
+---
+
+# R packages
+
+All subsequent analyses were performed in `R` using the following packages.
+
+-   R 4.5.2
+-   tidyverse 2.0.0
+-   colorspace 2.1-2
+-   vegan 2.7-3
+-   philentropy 0.10.0
+-   phyloseq 1.54.2
+-   ggpubr 0.6.3
+-   ggbeeswarm 0.7.3
+-   ANCOMBC 2.12.0
+-   ALDEx2 1.42.0
+-   microbiome 1.32.0
+
+```{r}
+library(tidyverse)
+library(colorspace)
+library(vegan)
+library(philentropy)
+library(phyloseq)
+library(ggpubr)
+library(ggbeeswarm)
+library(ANCOMBC)
+library(ALDEx2)
+```
+
+# Data import
+
+## Formatting of abundance table
+
+The species-level abundance table (`wf-16s-counts-species.csv`) was imported and formatted for downstream analysis.
+
+```{r}
+# Import abundance table
+# Remove rows classified as "Unknown"
+counts_raw <- read.csv(
+  "wf-16s-counts-species.csv",
+  check.names = FALSE
+) %>%
+  dplyr::filter(species != "Unknown")
+
+sample_cols <- names(counts_raw)[
+  2:(which(names(counts_raw) == "total") - 1)
+]
+
+# Taxonomic ranks available in the wf-16s output
+tax_levels <- c(
+  "species",
+  "genus",
+  "family",
+  "order",
+  "class",
+  "phylum"
+)
+```
+
+## Abundance filtering
+
+To minimize noise and eliminate potentially spurious reads, taxa that did not reach a relative abundance threshold (e.g., `0.25%`) in any single sample were removed. The abundance-filtered count table was defined as `counts_filt`.
+
+::: user-setting
+**User-defined parameter**
+
+Modify the abundance filter threshold in `make_tax_table()`:
+
+[abundance_threshold = 0.0025]{.user-param}
+:::
+
+```{r}
+# Function to generate taxonomic count tables
+make_tax_table <- function(
+    counts_raw,
+    sample_cols,
+    tax_level,
+    abundance_threshold = 0.0025
+) {
+
+  cat("Processing:", tax_level, "\n")
+
+  # Collapse taxa to selected rank
+  counts_tax <- counts_raw %>%
+    dplyr::filter(!is.na(.data[[tax_level]])) %>%
+    dplyr::group_by(.data[[tax_level]]) %>%
+    dplyr::summarise(
+      across(all_of(sample_cols), sum),
+      .groups = "drop"
+    ) %>%
+    as.data.frame()
+
+  rownames(counts_tax) <- counts_tax[[tax_level]]
+  counts_tax[[tax_level]] <- NULL
+
+  # Calculate relative abundance
+  rel <- sweep(counts_tax, 2, colSums(counts_tax), "/")
+
+  # Abundance filter (retain taxa reaching ≥0.25% in at least one sample)
+  counts_filt <- counts_tax[
+    rowSums(
+      rel >= abundance_threshold,
+      na.rm = TRUE
+    ) > 0,
+    ,
+    drop = FALSE
+  ]
+
+  return(
+    list(
+      counts_tax = counts_tax,
+      counts_filt = counts_filt
+    )
+  )
+
+}
+```
+
+## Generation of taxonomic count tables
+
+Taxonomic count tables were generated for each rank (species, genus, family, order, class, and phylum).
+
+```{r}
+# Create taxonomic count tables for all ranks
+results <- lapply(
+  tax_levels,
+  function(x)
+    make_tax_table(
+      counts_raw = counts_raw,
+      sample_cols = sample_cols,
+      tax_level = x
+    )
+)
+
+names(results) <- tax_levels
+```
+
+## Metadata table
+
+A sample metadata table (`metadata.csv`) was prepared to define group assignments for downstream analyses. The table included sample identifiers and corresponding group information.
+
+Example format:
+
+::: {style="max-width: 200px;"}
+| sample | group   |
+|--------|---------|
+| N01    | non-LCS |
+| N02    | non-LCS |
+| ...    | non-LCS |
+| W01    | LCS     |
+| W02    | LCS     |
+| ...    | LCS     |
+:::
+
+The metadata file was loaded into the `metadata` object for subsequent analyses.
+
+::: user-setting
+**User-defined parameter**
+
+Enter the names of the reference and target groups as they appear in the metadata file:
+
+group_order \<- c("\<reference\>", "\<target\>")
+
+[group_order \<- c("non-LCS", "LCS")]{.user-param}
+:::
+
+```{r}
+# Import sample metadata
+metadata <- read.csv("metadata.csv", row.names = 1, check.names = FALSE)
+
+# Define reference and target groups (e.g., non-LCS as reference)
+group_order <- c("non-LCS", "LCS")
+
+metadata$group <- factor(
+  metadata$group,
+  levels = group_order
+)
+
+ref_group <- group_order[1]
+target_group <- group_order[2]
+
+# Define colors for each group
+cols_map <- setNames(
+  c("#1f78b4", "#fb6a4a"),
+  group_order
+)
+```
+
+# Community composition
+
+Taxonomic composition was assessed using abundance-filtered count tables (`counts_filt`). For each taxonomic rank (species to phylum), relative abundances were calculated to generate composition tables. Taxa reaching relative abundance threshold (e.g., `≥10%`) in at least one sample were classified as major taxa, while all remaining taxa were combined into an "Others" category. Taxonomic composition was visualized using stacked bar plots.
+
+::: user-setting
+**User-defined parameter**
+
+Modify the relative abundance threshold (%) used to define major taxa in `make_composition_plot()`:
+
+[major_threshold = 10]{.user-param}
+:::
+
+## Function definitions
+
+```{r}
+# Function to generate composition tables and plots
+make_composition_plot <- function(
+    counts,
+    tax_level,
+    output_suffix = "",
+    major_threshold = 10
+) {
+
+  # Convert to relative abundance (%)
+  relative <- t(counts)
+
+  relative <- relative /
+    rowSums(relative) * 100
+
+  relative <- as.data.frame(relative)
+
+  # Define major taxa
+  major_taxa <- colnames(relative)[
+    apply(relative, 2, max) >= major_threshold
+  ]
+
+  minor_taxa <- setdiff(
+    colnames(relative),
+    major_taxa
+  )
+
+  composition <- relative[
+    ,
+    major_taxa,
+    drop = FALSE
+  ]
+
+  if (length(minor_taxa) > 0) {
+
+    composition$Others <- rowSums(
+      relative[
+        ,
+        minor_taxa,
+        drop = FALSE
+      ]
+    )
+  }
+
+  # Sort taxa by mean abundance
+  if (length(major_taxa) > 0) {
+
+    avg_abundance <- colMeans(
+      composition[
+        ,
+        major_taxa,
+        drop = FALSE
+      ]
+    )
+
+    sorted <- names(
+      sort(
+        avg_abundance,
+        decreasing = TRUE
+      )
+    )
+
+    if ("Others" %in% colnames(composition)) {
+
+      composition <- composition[
+        ,
+        c(sorted, "Others"),
+        drop = FALSE
+      ]
+    } else {
+      
+      composition <- composition[
+        ,
+        sorted,
+        drop = FALSE
+      ]        
+    }
+  }  
+
+  # Export tables
+  write.csv(
+    relative,
+    paste0(
+      "comp_all_",
+      output_suffix,
+      tax_level,
+      ".csv"
+    )
+  )
+
+  write.csv(
+    composition,
+    paste0(
+      "comp_major_",
+      output_suffix,
+      tax_level,
+      ".csv"
+    )
+  )
+
+  # Prepare plotting data
+  composition$Sample <- rownames(composition)
+
+  comp_long <- composition %>%
+    tidyr::pivot_longer(
+      cols = -Sample,
+      names_to = "Taxon",
+      values_to = "Abundance"
+    )
+
+  taxa_order <- setdiff(
+    colnames(composition),
+    "Sample"
+  )
+
+  comp_long$Taxon <- factor(
+    comp_long$Taxon,
+    levels = taxa_order
+  )
+
+  # Generate color palette
+  num_major_taxa <- sum(
+    taxa_order != "Others"
+  )
+  
+  if (num_major_taxa > 0) {
+    
+    custom_colors <- colorspace::qualitative_hcl(
+      n = max(num_major_taxa, 1),
+      palette = "Dynamic"
+    )
+
+    names(custom_colors) <-
+      taxa_order[taxa_order != "Others"]
+    
+  } else {
+    
+    custom_colors <- c()
+  }
+ 
+  if ("Others" %in% taxa_order) {
+    
+    full_colors <- c(
+      custom_colors,
+      Others = "#d0d0d0"
+    )
+    
+  } else {
+    
+    full_colors <- custom_colors
+  
+  }
+  
+  # Taxon label font style
+  taxon_face <- if (
+    tax_level %in% c("species", "genus")
+  ) {
+    "italic"
+  } else {
+    "plain"
+  }
+
+  # Create stacked bar plot
+  p_bar <- ggplot(
+    comp_long,
+    aes(
+      x = Sample,
+      y = Abundance,
+      fill = Taxon
+    )
+  ) +
+    geom_col(
+      width = 0.8,
+      position = position_stack(
+        reverse = TRUE
+      )
+    ) +
+    scale_fill_manual(
+      values = full_colors
+    ) +
+    scale_y_continuous(
+      expand = c(0, 0)
+    ) +
+    coord_cartesian(
+      ylim = c(0, 100)
+    ) +
+    labs(
+      x = NULL,
+      y = "Relative abundance (%)",
+      fill = NULL
+    ) +
+    theme_minimal() +
+    theme(
+      axis.text.x = element_text(
+        angle = 45,
+        hjust = 1,
+        size = 9
+      ),
+      axis.text.y = element_text(size = 9),
+      axis.title.y = element_text(size = 10),
+      axis.ticks.y = element_blank(),
+      legend.position = "bottom",
+      legend.key.size = unit(0.25, "cm"),
+      legend.spacing.y = unit(0.05, "cm"),
+      legend.text = element_text(
+        size = 8,
+        face = taxon_face
+      ),
+      panel.grid.major.y = element_line(
+        color = "#d9d9d9"
+      ),
+      panel.grid.major.x = element_blank(),
+      panel.grid.minor = element_blank()
+    )
+
+  # Export plot
+  ggsave(
+    paste0(
+      "comp_plot_",
+      output_suffix,
+      tax_level,
+      ".pdf"
+    ),
+    plot = p_bar,
+    width = 9.5,
+    height = 5
+  )
+
+  invisible(NULL)
+
+}
+```
+
+## Composition tables and plots
+
+```{r}
+# Generate composition tables and stacked bar plots for all taxonomic ranks
+lapply(
+  tax_levels,
+  function(x) {
+    
+    make_composition_plot(
+      counts = results[[x]]$counts_filt,
+      tax_level = x,
+      output_suffix = "full_"
+    )
+    
+  }  
+)
+```
+
+#### Outputs {.unnumbered .unlisted}
+
+For each taxonomic rank (species, genus, family, order, class, and phylum):
+
+-   `comp_all_full_<rank>.csv`
+    -   Relative abundance table containing all taxa
+-   `comp_major_full_<rank>.csv`
+    -   Relative abundance table used for plotting
+    -   Major taxa (≥10% in at least one sample) plus Others
+-   `comp_plot_full_<rank>.pdf`
+    -   Stacked bar plot of taxonomic composition
+
+# Taxonomic rank selection
+
+The taxonomic rank used for rarefaction, diversity analyses, and differential abundance testing was specified as follows. The example below is shown for `genus-level` analysis.
+
+::: user-setting
+**User-defined parameter**
+
+Select the taxonomic rank for downstream analyses:
+
+[tax_level \<- "genus"]{.user-param}
+
+Available options: `"phylum"`, `"class"`, `"order"`, `"family"`, `"genus"`, `"species"`.
+:::
+
+```{r}
+# Select count table for downstream analyses
+tax_level <- "genus"
+
+counts_filt <- results[[tax_level]]$counts_filt
+
+# Taxon label font style
+taxon_face <- if (
+  tax_level %in% c("species", "genus")
+) {
+  "italic"
+} else {
+  "plain"
+}
+```
+
+# Rarefaction analysis
+
+Rarefaction curves were generated using the filtered dataset (`counts_filt`) at the selected taxonomic rank to assess sequencing depth across samples.
+
+## Rarefaction curves
+
+```{r}
+# Match sample order
+metadata <- metadata[colnames(counts_filt), , drop = FALSE]
+
+# Assign colors to samples based on group
+cols <- cols_map[as.character(metadata$group)]
+
+# Plot and export rarefaction curves using all reads
+pdf(
+  paste0(
+    "rarecurve_full_",
+    tax_level,
+    ".pdf"
+  ),   
+  width = 6,
+  height = 5,
+  pointsize = 10
+)
+
+par(
+  cex.lab = 1.0,
+  cex.axis = 0.9
+)
+
+rarecurve(
+  t(counts_filt),
+  step = 100,
+  col = adjustcolor(cols, alpha.f = 0.6),
+  lwd = 2,
+  label = FALSE,
+  xlab = "Number of reads",
+  ylab = "Observed taxa"
+)
+
+legend(
+  "bottomright",
+  legend = group_order,
+  col = cols_map[group_order],
+  lty = 1,
+  lwd = 2,
+  bty = "n",
+  cex = 1.0
+)
+
+dev.off()
+```
+
+#### Outputs {.unnumbered .unlisted}
+
+-   `rarecurve_full_<rank>.pdf`
+
+## Sequencing depth estimation
+
+To assess sequencing depth sufficiency, taxonomic coverage was estimated using rarefaction curves across a range of sequencing depths (e.g., 1,000–20,000 reads). Coverage represented the proportion of observed taxa at each depth relative to the maximum richness per sample. The mean taxonomic coverage was calculated to determine the optimal rarefaction depth for downstream analyses.
+
+::: user-setting
+**User-defined parameter**
+
+Specify the sequencing depth range and interval for taxonomic coverage estimation:
+
+step = \<interval\>
+
+depths \<- seq(\<minimum_depth\>, \<maximum_depth\>, by = \<interval\>)
+
+[step = 100]{.user-param}
+
+[depths \<- seq(1000, 20000, by = 1000)]{.user-param}
+
+For consistency, depth interval (`by`) should match `step` or be an integer multiple of `step`.
+:::
+
+```{r}
+# Generate rarefaction curves
+# `step`: interval at which rarefaction values are calculated.
+rare_data <- rarecurve(
+  t(counts_filt),
+  step = 100,
+  sample = NULL,
+  label = FALSE,
+  tidy = TRUE
+)
+
+# Obtain filtered read counts for each sample
+sample_depths <- rare_data %>%
+  group_by(Site) %>%
+  summarise(
+    reads = max(Sample),
+    .groups = "drop"
+  )
+
+# Calculate taxonomic coverage at each depth
+depths <- seq(1000, 20000, by = 1000)
+
+coverage <- lapply(depths, function(target_depth) {
+  rare_data %>%
+    group_by(Site) %>%
+    summarise(
+      max_taxa = max(Species),
+      max_reads = max(Sample),
+      taxa_at_depth = if (
+        target_depth <= max_reads &&
+        any(Sample <= target_depth)
+      ) {
+        max(Species[Sample <= target_depth], na.rm = TRUE)
+      } else {
+        NA_real_
+      },
+      coverage = if (!is.na(max_taxa) && max_taxa > 0) {
+        round(taxa_at_depth / max_taxa * 100, 2)
+      } else {
+        NA_real_
+      },
+      .groups = "drop"
+    ) %>%
+    mutate(depth = target_depth)
+
+}) %>%
+  bind_rows()
+
+# Create coverage table
+coverage_res <- coverage %>%
+  dplyr::select(Site, depth, coverage) %>%
+  mutate(depth = paste0("Depth_", depth)) %>%
+  pivot_wider(
+    names_from = depth,
+    values_from = coverage
+  ) %>%
+  left_join(sample_depths, by = "Site") %>%
+  relocate(reads, .after = Site)
+
+# Summarize taxonomic coverage across samples at each sequencing depth
+coverage_summary <- coverage %>%
+  group_by(depth) %>%
+  summarise(
+    mean_coverage = mean(coverage, na.rm = TRUE),
+    sd_coverage = sd(coverage, na.rm = TRUE),
+    n_samples = sum(!is.na(coverage)),
+    .groups = "drop"
+  )
+
+# Export results
+write.csv(
+  coverage_res,
+  paste0("cov_res_", tax_level, ".csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  coverage_summary,
+  paste0("cov_summ_", tax_level, ".csv"),
+  row.names = FALSE
+)
+```
+
+#### Outputs {.unnumbered .unlisted}
+
+-   `cov_res_<rank>.csv`
+-   `cov_summ_<rank>.csv`
+
+# Preparation of analysis datasets
+
+Samples with sequencing depths below the selected rarefaction threshold were excluded from the abundance-filtered count table. The resulting dataset was defined as `counts_depth`. For diversity analyses, `counts_depth` was rarefied to the selected sequencing depth, generating `counts_rare`. Rarefaction curves up to the defined read depth were constructed to highlight the initial slope. Additionally, composition tables and stacked bar plots at the selected sequencing depth and taxonomic rank were generated using the `counts_rare` dataset.
+
+::: user-setting
+**User-defined parameter**
+
+Specify the rarefaction threshold (reads per sample) used to generate the rarefied dataset:
+
+[rarefaction_depth \<- 4900]{.user-param}
+:::
+
+```{r}
+# Determine rarefaction depth
+rarefaction_depth <- 4900
+
+# Exclude samples below the selected rarefaction depth
+counts_depth <- counts_filt[, colSums(counts_filt) >= rarefaction_depth, drop = FALSE]
+
+# Rarefy counts to a fixed depth
+set.seed(123)
+counts_rare <- t(
+  rrarefy(
+    t(counts_depth),
+    sample = rarefaction_depth
+  )
+)
+
+# Match sample order
+metadata <- metadata[colnames(counts_rare), , drop = FALSE]
+cols <- cols_map[as.character(metadata$group)]
+
+# Generate truncated rarefaction curves up to the defined read depth.
+pdf(
+  paste0(
+    "rarecurve_trunc_",
+    tax_level,
+    ".pdf"
+  ),  
+  width = 6,
+  height = 5,
+  pointsize = 10
+)
+
+par(
+  cex.lab = 1.0,
+  cex.axis = 0.9
+)
+
+rarecurve(
+  t(counts_depth),
+  step = 50,
+  xlim = c(0, rarefaction_depth),
+  col = adjustcolor(cols, alpha.f = 0.6),
+  lwd = 2,
+  label = FALSE,
+  xlab = "Number of reads",
+  ylab = "Observed taxa"
+)
+
+legend(
+  "bottomright",
+  legend = group_order,
+  col = cols_map[group_order],
+  lty = 1,
+  lwd = 2,
+  bty = "n",
+  cex = 1.0
+)
+
+dev.off()
+
+# Generate composition tables and stacked bar plots using rarefied counts.
+make_composition_plot(
+  counts = counts_rare,
+  tax_level = tax_level,
+  output_suffix = "rare_"
+)
+```
+
+#### Outputs {.unnumbered .unlisted}
+
+-   `rarecurve_trunc_<rank>.pdf`
+-   `comp_all_rare_<rank>.csv`
+-   `comp_major_rare_<rank>.csv`
+-   `comp_plot_rare_<rank>.pdf`
+
+# Alpha diversity
+
+## Estimation of alpha diversity indices
+
+Alpha diversity metrics, including the observed `richness` and `Shannon index`, were calculated based on the `counts_rare` dataset.
+
+```{r}
+# Match sample order
+metadata <- metadata[colnames(counts_rare), , drop = FALSE]
+
+# Calculate richness (number of observed taxa)
+richness <- vegan::specnumber(t(counts_rare))
+
+# Calculate Shannon diversity index
+shannon <- vegan::diversity(t(counts_rare), index = "shannon")
+
+# Create alpha diversity table
+df_alpha <- data.frame(
+  Richness = richness,
+  Shannon  = shannon
+)
+
+plot_data <- cbind(metadata, df_alpha)
+
+plot_data$group <- factor(
+  plot_data$group,
+  levels = group_order
+)
+
+# --- Console Output ---
+cat("\n==============================\n")
+cat(" Summary statistics by group\n")
+cat("==============================\n")
+
+cat("\n=== Richness ===\n")
+by(plot_data$Richness, plot_data$group, summary)
+
+cat("\n=== Shannon ===\n")
+by(plot_data$Shannon, plot_data$group, summary)
+
+cat("\n==============================\n")
+cat(" Wilcoxon rank-sum tests\n")
+cat("==============================\n")
+
+cat("\n=== Richness ===\n")
+wilcox_richness <- wilcox.test(Richness ~ group, data = plot_data)
+print(wilcox_richness)
+
+cat("\n=== Shannon ===\n")
+wilcox_shannon <- wilcox.test(Shannon ~ group, data = plot_data)
+print(wilcox_shannon)
+
+# Export results
+write.csv(
+  plot_data,
+  file = paste0("alpha_", tax_level, ".csv")
+)  
+```
+
+#### Outputs {.unnumbered .unlisted}
+
+-   `alpha_<rank>.csv`
+
+## Alpha diversity boxplots
+
+```{r}
+# Position for p-value label
+p_label_x <- (length(group_order) + 1) / 2
+
+# Richness plot
+p_richness <- ggplot(
+  plot_data,
+  aes(x = group, y = Richness, fill = group)
+) +
+  geom_boxplot(
+    width = 0.6,
+    alpha = 0.6,
+    outlier.shape = NA,
+    staplewidth = 0.2
+  ) +
+  geom_quasirandom(
+    width = 0.2,
+    size = 2
+  ) +
+  stat_compare_means(
+    method = "wilcox.test",
+    label = "p.format",
+    label.x = p_label_x,
+    size = 3.5
+  ) +
+  scale_fill_manual(values = cols_map) +
+  labs(
+    x = NULL,
+    y = "Observed richness"
+  ) +
+  theme_classic() +
+  theme(
+    legend.position = "none",
+    axis.text.x = element_text(size = 10), 
+    axis.text.y = element_text(size = 9),
+    axis.title.y = element_text(size = 10)
+  )
+
+# Shannon plot
+p_shannon <- ggplot(
+  plot_data,
+  aes(x = group, y = Shannon, fill = group)
+) +
+  geom_boxplot(
+    width = 0.6,
+    alpha = 0.6,
+    outlier.shape = NA,
+    staplewidth = 0.2
+  ) +
+  geom_quasirandom(
+    width = 0.1,
+    size = 2
+  ) +
+  stat_compare_means(
+    method = "wilcox.test",
+    label = "p.format",
+    label.x = p_label_x,
+    size = 3.5
+  ) +
+  scale_fill_manual(values = cols_map) +
+  labs(
+    x = NULL,
+    y = "Shannon index"
+  ) +
+  theme_classic() +
+  theme(
+    legend.position = "none",
+    axis.text.x = element_text(size = 10), 
+    axis.text.y = element_text(size = 9),
+    axis.title.y = element_text(size = 10)
+  )
+
+# Save plots as PDF
+ggsave(
+  paste0("richness_", tax_level, ".pdf"),
+  plot = p_richness,
+  width = 3,
+  height = 4
+)
+
+ggsave(
+  paste0("shannon_", tax_level, ".pdf"),
+  plot = p_shannon,
+  width = 3,
+  height = 4
+)
+```
+
+#### Outputs {.unnumbered .unlisted}
+
+-   `richness_<rank>.pdf`
+-   `shannon_<rank>.pdf`
+
+# Beta diversity
+
+Beta diversity was assessed using the `counts_rare` dataset with three measures of community dissimilarity: `Bray–Curtis` dissimilarity, `Jaccard` distance, and `Jensen–Shannon` distance (JSD). Differences in community composition between groups were evaluated using permutational multivariate analysis of variance (`PERMANOVA`), and patterns of community dissimilarity were visualized using principal coordinates analysis (`PCoA`). Group assignments were based on the `metadata`. For JSD, the square root of Jensen–Shannon divergence was used to obtain a distance measure for subsequent analyses.
+
+## Distance matrix calculation and statistical testing
+
+```{r}
+# Bray-Curtis dissimilarity
+bray_curtis <- vegdist(
+  t(counts_rare),
+  method = "bray"
+)
+
+# Jaccard dissimilarity (binary)
+jaccard <- vegdist(
+  t(counts_rare),
+  method = "jaccard",
+  binary = TRUE
+)
+
+# Jensen-Shannon divergence
+# Convert counts to relative abundance
+rel_abund <- t(counts_rare)
+
+rel_abund <- sweep(
+  rel_abund,
+  1,
+  rowSums(rel_abund),
+  "/"
+)
+
+rownames(rel_abund) <- colnames(counts_rare)
+
+# Calculate Jensen-Shannon divergence
+jsd <- philentropy::distance(
+  rel_abund,
+  method = "jensen-shannon"
+)
+
+# Restore sample names
+rownames(jsd) <- colnames(counts_rare)
+colnames(jsd) <- colnames(counts_rare)
+
+# Convert divergence to Jensen-Shannon distance
+js_distance <- as.dist(sqrt(jsd))
+
+# Match sample order
+metadata <- metadata[colnames(counts_rare), , drop = FALSE]
+
+metadata$group <- factor(
+  metadata$group,
+  levels = group_order
+)
+
+# PERMANOVA (Bray-Curtis)
+set.seed(123)
+permanova_bray <- adonis2(
+  bray_curtis ~ group,
+  data = metadata
+)
+
+# PERMANOVA (Jaccard)
+set.seed(123)
+permanova_jaccard <- adonis2(
+  jaccard ~ group,
+  data = metadata
+)
+
+# PERMANOVA (Jensen-Shannon)
+set.seed(123)
+permanova_jsd <- adonis2(
+  js_distance ~ group,
+  data = metadata
+)
+
+# --- Console Output ---
+
+cat("\n--- PERMANOVA (Bray-Curtis) ---\n")
+cat("R-squared:", round(permanova_bray$R2[1], 3), "\n")
+cat("P-value:", permanova_bray$`Pr(>F)`[1], "\n")
+
+cat("\n--- PERMANOVA (Jaccard) ---\n")
+cat("R-squared:", round(permanova_jaccard$R2[1], 3), "\n")
+cat("P-value:", permanova_jaccard$`Pr(>F)`[1], "\n")
+
+cat("\n--- PERMANOVA (Jensen-Shannon) ---\n")
+cat("R-squared:", round(permanova_jsd$R2[1], 3), "\n")
+cat("P-value:", permanova_jsd$`Pr(>F)`[1], "\n")
+```
+
+## Visualization by PCoA
+
+```{r}
+# Define a common function for PCoA
+run_pcoa <- function(
+  distance_matrix,
+  permanova_result,
+  method_name,
+  metadata,
+  cols_map,
+  group_order,
+  tax_level
+) {
+
+  # PCoA
+  pcoa_result <- cmdscale(
+    distance_matrix,
+    k = 2,
+    eig = TRUE
+  )
+
+  # Construct the plotting dataset
+  pcoa_points <- as.data.frame(pcoa_result$points)
+
+  colnames(pcoa_points) <- c(
+    "PCoA1",
+    "PCoA2"
+  )
+
+  pcoa_points$group <- metadata$group
+
+  # Calculate variance explained by each axis
+  eig_values <- pcoa_result$eig
+
+  positive_eig <- eig_values[
+    eig_values > 0
+  ]
+
+  variance_explained <- (
+    positive_eig /
+    sum(positive_eig)
+  )
+
+  var1 <- round(
+    variance_explained[1] * 100,
+    1
+  )
+
+  var2 <- round(
+    variance_explained[2] * 100,
+    1
+  )
+
+  # Format PERMANOVA results
+  permanova_label <- paste0(
+    "PERMANOVA\n",
+    "R² = ", round(permanova_result$R2[1], 3),
+    "\n",
+    "P = ", signif(permanova_result$`Pr(>F)`[1], 3)
+  )
+
+  # Visualize PCoA results
+  p_pcoa <- ggplot(
+    pcoa_points,
+    aes(
+      x = PCoA1,
+      y = PCoA2,
+      color = group,
+      fill = group
+    )
+  ) +
+    stat_ellipse(
+      geom = "polygon",
+      type = "t",
+      alpha = 0.2,
+      color = NA
+    ) +
+    geom_point(size = 3) +
+    annotate(
+      "text",
+      x = Inf,
+      y = Inf,
+      label = permanova_label,
+      hjust = 1,
+      vjust = 1,
+      size = 3.5
+    ) +
+    coord_fixed() +
+    scale_color_manual(
+      values = cols_map,
+      breaks = group_order
+    ) +
+    scale_fill_manual(
+      values = cols_map,
+      breaks = group_order
+    ) +
+    labs(
+      x = paste0("PCoA1 (", var1, "%)"),
+      y = paste0("PCoA2 (", var2, "%)"),
+      color = NULL,
+      fill = NULL
+    ) +
+    theme_minimal() +
+    theme(
+      axis.title.x = element_text(size = 10),
+      axis.title.y = element_text(size = 10),
+      axis.text.x  = element_text(size = 9),
+      axis.text.y  = element_text(size = 9),
+      legend.text  = element_text(size = 10)
+    )
+
+  # Save plot to file
+  ggsave(
+    paste0("pcoa_", method_name, "_", tax_level, ".pdf"),
+    plot = p_pcoa,
+    width = 6,
+    height = 5
+  )
+
+  # Return PCoA results and plot
+  return(list(
+    pcoa = pcoa_result,
+    points = pcoa_points,
+    plot = p_pcoa
+  ))
+}
+
+# PCoA (Bray-Curtis)
+result_bray <- run_pcoa(
+  distance_matrix = bray_curtis,
+  permanova_result = permanova_bray,
+  method_name = "bray",
+  metadata = metadata,
+  cols_map = cols_map,
+  group_order = group_order,
+  tax_level = tax_level
+)
+
+# PCoA (Jaccard)
+result_jaccard <- run_pcoa(
+  distance_matrix = jaccard,
+  permanova_result = permanova_jaccard,
+  method_name = "jaccard",
+  metadata = metadata,
+  cols_map = cols_map,
+  group_order = group_order,
+  tax_level = tax_level
+)
+
+# PCoA (Jensen-Shannon)
+result_jsd <- run_pcoa(
+  distance_matrix = js_distance,
+  permanova_result = permanova_jsd,
+  method_name = "jsd",
+  metadata = metadata,
+  cols_map = cols_map,
+  group_order = group_order,
+  tax_level = tax_level
+)
+```
+
+#### Outputs {.unnumbered .unlisted}
+
+-   `pcoa_bray_<rank>.pdf`
+-   `pcoa_jaccard_<rank>.pdf`
+-   `pcoa_jsd_<rank>.pdf`
+
+# Differential abundance
+
+To identify bacterial taxa with significantly different abundances between groups, differential abundance analysis (`DAA`) was performed.
+
+## Prevalence filtering
+
+Prevalence filtering was applied to the non-rarefied dataset (`counts_depth`) to exclude taxa detected in fewer than `two` samples, thereby reducing noise from sparsely observed taxa and improving statistical robustness. The resulting filtered data (`counts_prv`) were used for the analysis, applying group information from the `metadata` object.
+
+::: user-setting
+**User-defined parameter**
+
+Specify the prevalence threshold (minimum number of samples in which a taxon must be detected):
+
+[counts_prv \<- counts_depth\[rowSums(counts_depth \> 0) \>= 2, \]]{.user-param}
+:::
+
+```{r}
+# Prevalence filtering (retain taxa detected in ≥2 samples)
+counts_prv <- counts_depth[rowSums(counts_depth > 0) >= 2, ]
+
+# Match sample order
+metadata <- metadata[colnames(counts_prv), , drop = FALSE]
+metadata$group <- factor(
+  metadata$group,
+  levels = group_order
+  )
+```
+
+## Analysis of Compositions of Microbiomes with Bias Correction 2 (ANCOM-BC2)
+
+### Statistical analysis
+
+Differentially abundant taxa were identified using `ANCOM-BC2` (q \< 0.05). Taxa passing the sensitivity analysis were classified as robust findings, while those detected without the sensitivity score filter were considered exploratory.
+
+```{r}
+# Construct phyloseq object
+tax_matrix <- data.frame(Taxa = rownames(counts_prv))
+rownames(tax_matrix) <- rownames(counts_prv)
+
+ps <- phyloseq(
+  otu_table(counts_prv, taxa_are_rows = TRUE),
+  sample_data(metadata),
+  tax_table(as.matrix(tax_matrix))
+)
+
+# Run ANCOM-BC2
+out <- ancombc2(
+  data = ps,
+  fix_formula = "group",
+  tax_level = NULL,
+  p_adj_method = "fdr",
+  prv_cut = 0,
+  group = "group",
+  struc_zero = TRUE,
+  neg_lb = TRUE,
+  alpha = 0.05
+)
+
+# Extract results
+res_ancom <- out$res
+
+# Column indicating exploratory significance
+diff_group_col <- paste0("diff_group", target_group)
+
+# Column indicating robust significance
+diff_robust_col <- paste0("diff_robust_group", target_group)
+
+# Add significance label
+res_ancom$significance <- ifelse(
+  res_ancom[[diff_group_col]], "*", "ns")
+
+res_ancom$significance_robust <- ifelse(
+  res_ancom[[diff_robust_col]], "*", "ns")
+
+# Export full results table
+write.csv(
+  res_ancom,
+  paste0("ancom_", tax_level, ".csv"),
+  row.names = FALSE
+)
+```
+
+#### Outputs {.unnumbered .unlisted}
+
+-   `ancom_<rank>.csv`
+
+### Visualization of ANCOM-BC2 results
+
+Log fold changes estimated by ANCOM-BC2 were visualized as bar plots. Error bars represent 95% confidence intervals.
+
+```{r}
+# Prepare ANCOM-BC2 results
+lfc_col <- paste0("lfc_group", target_group)
+se_col <- paste0("se_group", target_group)
+
+df_ancom <- res_ancom %>%
+  arrange(.data[[lfc_col]]) %>%
+  mutate(
+    group_direction = ifelse(
+      .data[[lfc_col]] > 0,
+      target_group,
+      ref_group
+    ),
+
+    ci_lower = .data[[lfc_col]] -
+      1.96 * .data[[se_col]],
+
+    ci_upper = .data[[lfc_col]] +
+      1.96 * .data[[se_col]]
+  )
+
+df_ancom$group_direction <- factor(
+  df_ancom$group_direction,
+  levels = c(target_group, ref_group)
+)
+```
+
+#### Top taxa by absolute log fold change {.unnumbered .unlisted}
+
+```{r}
+# Select taxa with the largest absolute log fold changes (max 20 taxa)
+df_ancom_top <- df_ancom %>%
+  slice_max(
+    order_by = abs(.data[[lfc_col]]),
+    n = 20,
+    with_ties = FALSE
+  ) %>%
+  arrange(.data[[lfc_col]])
+
+df_ancom_top$taxon <- factor(
+  df_ancom_top$taxon,
+  levels = df_ancom_top$taxon
+)
+
+# Generate bar plot of log fold change with confidence intervals
+p_ancom_top <- ggplot(
+  df_ancom_top,
+  aes(
+    x = .data[[lfc_col]],
+    y = taxon,
+    fill = group_direction
+  )
+) +
+  geom_col(
+    width = 0.7,
+    alpha = 0.6
+  ) +
+  geom_errorbar(
+    aes(
+      xmin = ci_lower,
+      xmax = ci_upper
+    ),
+    orientation = "y",
+    height = 0.2,
+    color = "black"
+  ) +
+  geom_vline(
+    xintercept = 0,
+    linetype = "dashed"
+  ) +
+  scale_fill_manual(
+    values = cols_map,
+    breaks = c(target_group, ref_group)
+  ) +
+  labs(
+    x = paste0("Log fold change (", target_group, " vs ", ref_group, ")"),
+    y = NULL,
+    fill = NULL
+  ) +
+  theme_bw() +
+  theme(
+    panel.grid.major.x = element_line(color = "#eeeeee"),
+    panel.grid.major.y = element_blank(),
+    axis.title.x = element_text(size = 10),
+    axis.title.y = element_text(size = 10),
+    axis.text.x = element_text(size = 9),
+    axis.text.y = element_text(face = taxon_face, size = 10),
+    legend.text = element_text(size = 10)
+  )
+
+# Save plot to file
+ggsave(
+  paste0("ancom_top_", tax_level, ".pdf"),
+  plot = p_ancom_top,
+  width = 6,
+  height = 5
+)
+```
+
+#### Differentially abundant taxa {.unnumbered .unlisted}
+
+(robust: q \< 0.05 with sensitivity score filter)
+
+```{r}
+# Select taxa that passed the sensitivity analysis
+df_ancom_sig <- df_ancom %>%
+  filter(
+    .data[[diff_robust_col]]
+  ) %>%
+  arrange(.data[[lfc_col]])
+
+df_ancom_sig$taxon <- factor(
+  df_ancom_sig$taxon,
+  levels = df_ancom_sig$taxon
+)
+
+# Generate bar plot of log fold change with confidence intervals
+if (nrow(df_ancom_sig) > 0) {
+
+  p_ancom_sig <- ggplot(
+    df_ancom_sig,
+    aes(
+      x = .data[[lfc_col]],
+      y = taxon,
+      fill = group_direction
+    )
+  ) +
+    geom_col(
+      width = 0.7,
+      alpha = 0.6
+    ) +
+    geom_errorbar(
+      aes(
+        xmin = ci_lower,
+        xmax = ci_upper
+      ),
+      orientation = "y",
+      height = 0.2,
+      color = "black"
+    ) +
+    geom_vline(
+      xintercept = 0,
+      linetype = "dashed"
+    ) +
+    scale_fill_manual(
+      values = cols_map,
+      breaks = c(target_group, ref_group)
+    ) +
+    labs(
+      x = paste0("Log fold change (", target_group, " vs ", ref_group, ")"),
+      y = NULL,
+      fill = NULL
+    ) +
+    theme_bw() +
+    theme(
+    panel.grid.major.x = element_line(color = "#eeeeee"),
+    panel.grid.major.y = element_blank(),
+    axis.title.x = element_text(size = 10),
+    axis.title.y = element_text(size = 10),
+    axis.text.x = element_text(size = 9),
+    axis.text.y = element_text(face = taxon_face, size = 10),
+    legend.text = element_text(size = 10)
+  )
+
+  # Save plot to file
+  ggsave(
+    paste0("ancom_sig_", tax_level, ".pdf"),
+    plot = p_ancom_sig,
+    width = 6,
+    height = 5
+  )
+
+} else {
+  cat("No taxa passed the ANCOM-BC2 sensitivity analysis.\n")
+}
+```
+
+#### Outputs {.unnumbered .unlisted}
+
+-   `ancom_top_<rank>.pdf`
+-   `ancom_sig_<rank>.pdf` (generated only if significant taxa are detected)
+
+## ANOVA-Like Differential Expression (ALDEx2)
+
+### Statistical analysis
+
+Differential abundance analysis was performed using `ALDEx2`. Taxa with a Benjamini–Hochberg adjusted Wilcoxon test p-value (wi.eBH) \< 0.05 were considered significantly different between groups.
+
+```{r}
+# Define group variable
+conds <- as.character(metadata$group)
+
+conds <- ifelse(
+  conds == ref_group,
+  paste0("1_", ref_group),
+  paste0("2_", target_group)
+)
+
+# CLR transformation with Monte Carlo sampling
+set.seed(123)
+x <- aldex.clr(
+  counts_prv,
+  conds,
+  mc.samples = 256,
+  denom = "all",
+  verbose = TRUE
+)
+
+# Statistical testing
+aldex_test <- aldex.ttest(x)
+
+# Effect size estimation
+aldex_effect <- aldex.effect(x)
+
+# Combine results
+res_aldex <- data.frame(aldex_test, aldex_effect)
+
+# Add significance label
+res_aldex$significance <- ifelse(
+  res_aldex$wi.eBH < 0.05, "*", "ns")
+
+# Export results
+write.csv(
+  res_aldex,
+  paste0("aldex_", tax_level, ".csv"),
+  row.names = TRUE
+)
+```
+
+#### Outputs {.unnumbered .unlisted}
+
+-   `aldex_<rank>.csv`
+
+### Visualization of ALDEx2 results
+
+Effect sizes estimated by ALDEx2 were visualized as bar plots.
+
+```{r}
+# Prepare ALDEx2 results
+df_aldex <- res_aldex %>%
+  tibble::rownames_to_column("taxon") %>%
+  arrange(effect) %>%
+  mutate(
+    group_direction = ifelse(effect > 0, target_group, ref_group)
+  )
+
+df_aldex$group_direction <- factor(
+  df_aldex$group_direction,
+  levels = c(target_group, ref_group)
+)
+```
+
+#### Top taxa by absolute effect size {.unnumbered .unlisted}
+
+```{r}
+# Select taxa with the largest absolute effect size (max 20 taxa)
+df_aldex_top <- df_aldex %>%
+  slice_max(
+    order_by = abs(effect),
+    n = 20,
+    with_ties = FALSE
+  ) %>%
+  arrange(effect)
+
+df_aldex_top$taxon <- factor(
+  df_aldex_top$taxon,
+  levels = df_aldex_top$taxon
+)
+
+# Generate bar plot of ALDEx2 effect size
+p_aldex_top <- ggplot(
+  df_aldex_top,
+  aes(
+    x = effect,
+    y = taxon,
+    fill = group_direction
+  )
+) +
+  geom_col(width = 0.7, alpha = 0.6) +
+  geom_vline(
+    xintercept = 0,
+    linetype = "dashed"
+  ) +
+  scale_fill_manual(
+    values = cols_map,
+    breaks = c(target_group, ref_group)
+  ) +
+  labs(
+    x = paste0("Effect size (", target_group, " vs ", ref_group, ")"),
+    y = NULL,
+    fill = NULL
+  ) +
+  theme_bw() +
+  theme(
+    panel.grid.major.x = element_line(color = "#eeeeee"),
+    panel.grid.major.y = element_blank(),
+    axis.title.x = element_text(size = 10),
+    axis.title.y = element_text(size = 10),
+    axis.text.x = element_text(size = 9),
+    axis.text.y = element_text(face = taxon_face, size = 10),
+    legend.text = element_text(size = 10)
+  )
+
+# Save plot to file
+ggsave(
+  paste0("aldex_top_", tax_level, ".pdf"),
+  plot = p_aldex_top,
+  width = 6,
+  height = 5
+)
+```
+
+#### Differentially abundant taxa {.unnumbered .unlisted}
+
+```{r}
+# Select significant taxa
+df_aldex_sig <- df_aldex %>%
+  filter(
+    wi.eBH < 0.05
+  ) %>%
+  arrange(effect)
+
+df_aldex_sig$taxon <- factor(
+  df_aldex_sig$taxon,
+  levels = df_aldex_sig$taxon
+)
+
+# Generate bar plot of ALDEx2 effect size
+if (nrow(df_aldex_sig) > 0) {
+
+  p_aldex_sig <- ggplot(
+    df_aldex_sig,
+    aes(
+      x = effect,
+      y = taxon,
+      fill = group_direction
+    )
+  ) +
+    geom_col(
+      width = 0.7,
+      alpha = 0.6
+    ) +
+    geom_vline(
+      xintercept = 0,
+      linetype = "dashed"
+    ) +
+    scale_fill_manual(
+      values = cols_map,
+      breaks = c(target_group, ref_group)
+    ) +
+    labs(
+      x = paste0("Effect size (", target_group, " vs ", ref_group, ")"),
+      y = NULL,
+      fill = NULL
+    ) +
+    theme_bw() +
+    theme(
+      panel.grid.major.x = element_line(color = "#eeeeee"),
+      panel.grid.major.y = element_blank(),
+      axis.title.x = element_text(size = 10),
+      axis.title.y = element_text(size = 10),
+      axis.text.x = element_text(size = 9),
+      axis.text.y = element_text(face = taxon_face, size = 10),
+      legend.text = element_text(size = 10)
+    )
+
+  # Save plot to file
+  ggsave(
+    paste0("aldex_sig_", tax_level, ".pdf"),
+    plot = p_aldex_sig,
+    width = 6,
+    height = 5
+  )
+
+} else {
+  cat("No significant taxa were detected by ALDEx2.\n")
+}
+```
+
+#### Outputs {.unnumbered .unlisted}
+
+-   `aldex_top_<rank>.pdf`
+-   `aldex_sig_<rank>.pdf` (generated only if significant taxa are detected)
