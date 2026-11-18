@@ -23,4 +23,4 @@ The manuscript is currently under review.
 
 **Software DOI**
 
-[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.23944434.svg)](https://doi.org/10.5281/zenodo.23944434)
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.23944434.svg)](https://doi.org/10.5281/zenodo.23944433)
